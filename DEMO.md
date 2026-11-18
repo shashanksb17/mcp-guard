@@ -13,10 +13,16 @@ HTTPS tunnel (Cloudflare Tunnel or ngrok).
 ```bash
 git clone <your-repo-url> mcp-guard
 cd mcp-guard
+
+# Create the venv:
+#   macOS / Linux:  python3 -m venv .venv
+#   Windows:        python -m venv .venv
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"
-pytest -q                          # should be green
+
+# After the venv is active, use `python` on every OS (it points at the venv).
+python -m pip install -e ".[dev]"
+python -m pytest -q                # should be green
 ```
 
 Confirm Claude Desktop is installed and that you can edit config via
@@ -46,8 +52,10 @@ Keep the approval window visible (not behind Claude).
 # Optional: start from a known config. If you already have servers, install
 # will wrap all of them. To wrap only the demo, add it first.
 
+# Uses sys.executable so Claude launches the same interpreter as this venv
+# (works on macOS, Windows, and Linux).
 python - <<'PY'
-import json, pathlib, sys
+import json, sys
 from mcp_guard.paths import claude_desktop_config_path
 path = claude_desktop_config_path()
 path.parent.mkdir(parents=True, exist_ok=True)
@@ -107,11 +115,13 @@ Claude Web talks to MCP from **Anthropic’s cloud**, so your proxy must be on a
 public `https://…:443` URL.
 
 ```bash
-# Terminal D — upstream demo HTTP MCP
+# Terminal D — upstream demo HTTP MCP (serves POST /mcp)
 mcp-guard demo-http-server --port 8765
 
 # Terminal E — local reverse proxy
-mcp-guard http-proxy --server-name demo-http --upstream http://127.0.0.1:8765/mcp
+# Upstream is the *origin* only. The proxy appends the request path (/mcp),
+# so do not pass .../mcp here or you will get /mcp/mcp upstream.
+mcp-guard http-proxy --server-name demo-http --upstream http://127.0.0.1:8765/
 
 # Terminal F — publish :8742 (default proxy port) on HTTPS 443
 # Cloudflare quick tunnel example:
@@ -121,8 +131,8 @@ cloudflared tunnel --url http://127.0.0.1:8742
 
 1. Copy the `https://…` URL from the tunnel.
 2. In Claude Web: **Customize → Connectors → Add custom connector**.
-3. Paste `https://<tunnel>/mcp` (path must match what the proxy serves; with
-   this demo use the tunnel URL + `/mcp`).
+3. Paste `https://<tunnel>/mcp` (Claude will POST to `/mcp` on the proxy,
+   which forwards to `http://127.0.0.1:8765/mcp`).
 4. Auth: “No sign in” for the local demo.
 5. In a chat, enable the connector and repeat the Allow / Block prompts from §2.
 6. Narrate: “Anthropic’s servers hit my tunnel; the local proxy holds

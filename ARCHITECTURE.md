@@ -79,10 +79,12 @@ Per Anthropic’s docs
 - The server must be reachable on the public internet over **HTTPS port 443**.
 - Preferred transport is **Streamable HTTP** (legacy HTTP+SSE still exists).
 
-**Interception:** run `mcp-guard http-proxy --upstream <real MCP URL>`, expose
-it with a tunnel (Cloudflare Tunnel / ngrok) on 443, and register that public
-URL as the custom connector in Claude. Anthropic → tunnel → proxy → (approval)
-→ upstream.
+**Interception:** run
+`mcp-guard http-proxy --upstream http://127.0.0.1:8765/` (upstream **origin**
+only — request paths such as `/mcp` are appended; do not pass `.../mcp` as
+upstream or you get `/mcp/mcp`), expose the proxy with a tunnel (Cloudflare
+Tunnel / ngrok) on 443, and register `https://<tunnel>/mcp` as the custom
+connector in Claude. Anthropic → tunnel → proxy → (approval) → upstream.
 
 Desktop **remote** connectors use the same Anthropic-cloud path; local stdio
 entries in `claude_desktop_config.json` are a separate mechanism.

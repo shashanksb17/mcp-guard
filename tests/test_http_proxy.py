@@ -14,8 +14,25 @@ from fastapi.testclient import TestClient
 from mcp_guard.daemon.audit import AuditLog
 from mcp_guard.daemon.server import create_app
 from mcp_guard.demo_server.http_server import create_demo_http_app
-from mcp_guard.proxy.http_proxy import create_http_proxy_app
+from mcp_guard.proxy.http_proxy import create_http_proxy_app, join_upstream_url
 from mcp_guard.settings import Settings
+
+
+def test_join_upstream_url_appends_path_to_origin():
+    """Upstream must be an origin; /mcp is appended from the request path."""
+    assert join_upstream_url("http://127.0.0.1:8765/", "mcp") == (
+        "http://127.0.0.1:8765/mcp"
+    )
+    assert join_upstream_url("http://127.0.0.1:8765", "mcp") == (
+        "http://127.0.0.1:8765/mcp"
+    )
+    assert join_upstream_url("http://127.0.0.1:8765/", "") == (
+        "http://127.0.0.1:8765/"
+    )
+    # Document the footgun: including /mcp in upstream doubles the path.
+    assert join_upstream_url("http://127.0.0.1:8765/mcp", "mcp") == (
+        "http://127.0.0.1:8765/mcp/mcp"
+    )
 
 
 def _free_port() -> int:

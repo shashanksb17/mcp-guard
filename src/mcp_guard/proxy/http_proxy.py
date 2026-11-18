@@ -24,7 +24,6 @@ from __future__ import annotations
 import argparse
 import logging
 from typing import Any
-from urllib.parse import urljoin
 
 import httpx
 import uvicorn
@@ -60,6 +59,24 @@ HOP_BY_HOP = {
 }
 
 
+def join_upstream_url(upstream_base: str, path: str) -> str:
+    """
+    Append the incoming request path to an upstream *origin*.
+
+    ``upstream_base`` should be ``scheme://host[:port]/`` (for the demo:
+    ``http://127.0.0.1:8765/``). The client path (e.g. ``mcp``) is appended so
+    ``POST /mcp`` becomes ``http://127.0.0.1:8765/mcp``.
+
+    Do **not** put the MCP endpoint path in ``upstream_base`` as well
+    (e.g. ``http://127.0.0.1:8765/mcp``) — that would produce ``/mcp/mcp``.
+    """
+    base = upstream_base.rstrip("/")
+    suffix = path.lstrip("/")
+    if not suffix:
+        return f"{base}/"
+    return f"{base}/{suffix}"
+
+
 def _jsonrpc_error(request_id: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
 
@@ -79,7 +96,7 @@ def create_http_proxy_app(
 
     @app.api_route("/{path:path}", methods=["GET", "POST", "DELETE", "OPTIONS", "HEAD"])
     async def proxy(path: str, request: Request) -> Response:
-        target = urljoin(upstream_base, path)
+        target = join_upstream_url(upstream_base, path)
         if request.url.query:
             target = f"{target}?{request.url.query}"
 
@@ -226,7 +243,14 @@ def run_http_proxy(
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO)
     parser = argparse.ArgumentParser(prog="mcp-guard http-proxy")
-    parser.add_argument("--upstream", required=True, help="Upstream MCP base URL")
+    parser.add_argument(
+        "--upstream",
+        required=True,
+        help=(
+            "Upstream origin to reverse-proxy (e.g. http://127.0.0.1:8765/). "
+            "Request paths like /mcp are appended; do not include /mcp in this URL."
+        ),
+    )
     parser.add_argument("--server-name", required=True)
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)

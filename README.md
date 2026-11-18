@@ -15,10 +15,14 @@ JSON-RPC error and the upstream server never sees the invocation.
 ## Quick start
 
 ```bash
+# macOS / Linux:  python3 -m venv .venv
+# Windows:        python -m venv .venv
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -e ".[dev]"
-pytest -q
+
+# After activation, use `python` on every OS (venv interpreter).
+python -m pip install -e ".[dev]"
+python -m pytest -q
 ```
 
 Run the control plane (two processes):
@@ -127,25 +131,30 @@ Before:
 {
   "mcpServers": {
     "demo": {
-      "command": "python",
+      "command": "python3",
       "args": ["-m", "mcp_guard.demo_server.stdio_server"]
     }
   }
 }
 ```
 
-After:
+Prefer `python3` on macOS/Linux and `python` on Windows for hand-written
+configs — or use an absolute path / `sys.executable` from your venv (as in
+`DEMO.md`) so Claude Desktop does not depend on PATH.
+
+After (`install` rewrites `command` to the absolute interpreter that ran the
+installer, and keeps the original argv after `--`):
 
 ```json
 {
   "mcpServers": {
     "demo": {
-      "command": "/path/to/python",
+      "command": "/path/to/venv/bin/python",
       "args": [
         "-m", "mcp_guard.proxy.stdio_proxy",
         "--server-name", "demo",
         "--",
-        "python", "-m", "mcp_guard.demo_server.stdio_server"
+        "python3", "-m", "mcp_guard.demo_server.stdio_server"
       ],
       "env": { "MCP_GUARD_WRAPPED": "1" }
     }
@@ -166,8 +175,9 @@ mcp-guard restore
 mcp-guard status
 mcp-guard stdio-proxy --server-name NAME -- <command...>
 mcp-guard http-proxy --server-name NAME --upstream URL
+#   upstream is an origin, e.g. http://127.0.0.1:8765/  (paths like /mcp are appended)
 mcp-guard demo-server            # stdio demo MCP
-mcp-guard demo-http-server       # HTTP demo MCP on :8765
+mcp-guard demo-http-server       # HTTP demo MCP on :8765 (POST /mcp)
 ```
 
 ---
@@ -206,8 +216,8 @@ Full discussion: [ARCHITECTURE.md](./ARCHITECTURE.md).
 ## Tests
 
 ```bash
-pip install -e ".[dev]"
-pytest -q
+python -m pip install -e ".[dev]"
+python -m pytest -q
 ```
 
 Coverage includes JSON-RPC helpers, config backup/restore, concurrent approval
