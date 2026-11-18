@@ -9,7 +9,7 @@ description = "Human-in-the-loop approval gate for MCP tool calls from Claude De
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
-authors = [{ name = "MCP Guard Candidate" }]
+authors = [{ name = "Shashank Basutkar", email = "sbasutkar999@gmail.com" }]
 keywords = ["mcp", "claude", "security", "proxy", "json-rpc"]
 dependencies = [
   "fastapi>=0.115",
