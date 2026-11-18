@@ -111,6 +111,7 @@ Both proxies share one localhost daemon that owns the approval queue, timeouts, 
 | `MCP_GUARD_TIMEOUT` | `60` | Seconds to wait for Allow/Block |
 | `MCP_GUARD_FAIL_CLOSED` | `1` | Deny on timeout / daemon down |
 | `MCP_GUARD_FAIL_OPEN` | `0` | Debug only — forward if daemon/timeout fails |
+| `MCP_GUARD_HTTP_TOKEN` | unset | If set, the HTTP proxy only accepts `/<token>/…` paths or `Authorization: Bearer <token>` |
 | `MCP_GUARD_HOME` | platform app-data dir | Audit log + pid file location |
 | `MCP_GUARD_CLAUDE_CONFIG` | platform default | Override path to `claude_desktop_config.json` |
 
@@ -189,6 +190,13 @@ mcp-guard demo-http-server       # HTTP demo MCP on :8765 (POST /mcp)
 - The HTTP proxy **is** meant to be published via a tunnel for Claude Web —
   treat that URL like any remote MCP endpoint (auth headers / OAuth, short-lived
   tunnels for demos).
+- The daemon rejects requests whose `Host` header is not loopback (DNS-rebinding
+  protection), so a web page can't read pending calls or click Allow for you.
+- Set `MCP_GUARD_HTTP_TOKEN` before publishing the HTTP proxy through a tunnel.
+- `notifications/cancelled` (or Claude closing the pipe) withdraws the pending
+  popup; a cancelled call is never forwarded even if Allow is clicked later.
+- Batched JSON-RPC containing `tools/call` is never forwarded unapproved (stdio
+  splits the batch and approves each call; HTTP rejects the batch).
 - `audit.jsonl` can contain tool arguments (possibly secrets). Protect the
   app-data directory; do not commit the log.
 - `install` writes backups next to Claude’s config; review them before sharing

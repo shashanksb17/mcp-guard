@@ -33,7 +33,8 @@ def _python_executable() -> str:
 def _load(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {"mcpServers": {}}
-    with path.open("r", encoding="utf-8") as fh:
+    # utf-8-sig: Notepad often saves the config with a BOM.
+    with path.open("r", encoding="utf-8-sig") as fh:
         data = json.load(fh)
     if not isinstance(data, dict):
         raise ValueError(f"config root must be an object: {path}")
@@ -61,10 +62,21 @@ def backup_config(path: Path | None = None) -> Path:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     backup = path.with_name(f"{path.name}{CONFIG_BACKUP_SUFFIX}.{stamp}")
     shutil.copy2(path, backup)
-    # Also maintain a "latest" pointer for easy restore.
+    # "latest" pointer used by `restore`: it must keep the *pristine* config.
+    # Don't overwrite it with a config that MCP Guard has already wrapped,
+    # otherwise a second `install` makes `restore` restore the wrapped file.
     latest = path.with_name(f"{path.name}{CONFIG_BACKUP_SUFFIX}")
-    shutil.copy2(path, latest)
+    if not latest.exists() or not _config_has_wrapped(path):
+        shutil.copy2(path, latest)
     return backup
+
+
+def _config_has_wrapped(path: Path) -> bool:
+    try:
+        servers = _load(path).get("mcpServers") or {}
+    except (OSError, ValueError):
+        return False
+    return any(isinstance(e, dict) and _is_wrapped(e) for e in servers.values())
 
 
 def restore_config(
@@ -184,7 +196,13 @@ def wrap_servers(
     for name in names:
         if name not in servers:
             raise KeyError(f"server not found in config: {name}")
-        servers[name] = _wrap_entry(name, servers[name])
+        entry = servers[name]
+        if only is None and (not isinstance(entry, dict) or not entry.get("command")):
+            # Remote (url/http) entries can't be wrapped by the stdio proxy;
+            # skip them instead of aborting the whole install.
+            print(f"skipping '{name}': not a stdio server", file=sys.stderr)
+            continue
+        servers[name] = _wrap_entry(name, entry)
     if not dry_run:
         backup_config(path)
         _dump(path, data)

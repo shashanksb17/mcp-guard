@@ -7,10 +7,12 @@ import logging
 import os
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
+from uuid import uuid4
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from mcp_guard import __version__
 from mcp_guard.daemon.approval_queue import ApprovalQueue
@@ -91,6 +93,12 @@ def create_app(settings: Settings | None = None, audit: AuditLog | None = None) 
         version=__version__,
         lifespan=lifespan,
     )
+    # Reject requests whose Host is not loopback: blocks DNS-rebinding pages
+    # from reading /v1/approvals/pending or auto-approving via /decide.
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=["127.0.0.1", "localhost", "::1", "[::1]", "testserver"],
+    )
 
     @app.get("/health", response_model=HealthResponse)
     async def health() -> HealthResponse:
@@ -109,15 +117,21 @@ def create_app(settings: Settings | None = None, audit: AuditLog | None = None) 
     @app.post("/v1/approvals", response_model=DecisionResult)
     async def submit_approval(body: ApprovalRequestCreate) -> DecisionResult:
         """Block until the user decides (or timeout). Used by stdio/HTTP proxies."""
+        if not body.id:
+            body = body.model_copy(update={"id": str(uuid4())})
         state.audit.record(
             "approval_requested",
+            request_id=body.id,
             server_name=body.server_name,
             tool_name=body.tool_name,
             transport=body.transport,
             details={"arguments": body.arguments, "metadata": body.metadata},
         )
         state.broadcast({"type": "pending_changed"})
-        result = await state.queue.submit_and_wait(body)
+        try:
+            result = await state.queue.submit_and_wait(body)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         state.audit.record(
             "approval_decided",
             request_id=result.id,
@@ -144,6 +158,22 @@ def create_app(settings: Settings | None = None, audit: AuditLog | None = None) 
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return result
+
+    @app.post("/v1/approvals/{request_id}/cancel", response_model=DecisionResult)
+    async def cancel(request_id: str) -> DecisionResult:
+        """Proxy-side cancellation (client sent notifications/cancelled or hung up)."""
+        try:
+            result = await state.queue.cancel(request_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        state.audit.record(
+            "approval_cancelled",
+            request_id=request_id,
+            server_name=result.server_name,
+            tool_name=result.tool_name,
+            transport=result.transport,
+        )
         return result
 
     @app.get("/v1/audit")

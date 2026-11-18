@@ -15,19 +15,24 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import threading
-from typing import Any, TextIO
+import uuid
+from typing import Any, BinaryIO, TextIO
 
 from mcp_guard.client import ApprovalClient, DaemonUnavailable, decision_allows_forward
 from mcp_guard.jsonrpc import (
+    batch_contains_tools_call,
     blocked_response,
+    cancelled_request_id,
     daemon_down_response,
     encode_message,
     extract_tool_call,
     is_tools_call,
     parse_message,
+    error_response,
     timeout_response,
 )
 from mcp_guard.models import Decision
@@ -40,6 +45,49 @@ _stdout_lock = threading.Lock()
 _stdin_lock = threading.Lock()
 
 
+class _InFlight:
+    """jsonrpc id -> approval id for tools/call currently waiting on the user."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._by_rpc_id: dict[str, str] = {}
+        self._cancelled: set[str] = set()
+
+    @staticmethod
+    def _key(rpc_id: Any) -> str:
+        return repr(rpc_id)
+
+    def add(self, rpc_id: Any, approval_id: str) -> None:
+        with self._lock:
+            self._by_rpc_id[self._key(rpc_id)] = approval_id
+
+    def pop(self, rpc_id: Any) -> bool:
+        """Remove entry; return True if the client cancelled it meanwhile."""
+        with self._lock:
+            self._by_rpc_id.pop(self._key(rpc_id), None)
+            key = self._key(rpc_id)
+            if key in self._cancelled:
+                self._cancelled.discard(key)
+                return True
+            return False
+
+    def cancel(self, rpc_id: Any) -> str | None:
+        with self._lock:
+            approval_id = self._by_rpc_id.get(self._key(rpc_id))
+            if approval_id is not None:
+                self._cancelled.add(self._key(rpc_id))
+            return approval_id
+
+    def cancel_all(self) -> list[str]:
+        with self._lock:
+            ids = list(self._by_rpc_id.values())
+            self._cancelled.update(self._by_rpc_id.keys())
+            return ids
+
+
+_inflight = _InFlight()
+
+
 def _write_stdout(message: dict[str, Any]) -> None:
     with _stdout_lock:
         sys.stdout.buffer.write(encode_message(message))
@@ -48,8 +96,11 @@ def _write_stdout(message: dict[str, Any]) -> None:
 
 def _write_raw_to(stream, data: bytes) -> None:
     with _stdin_lock:
-        stream.write(data)
-        stream.flush()
+        try:
+            stream.write(data)
+            stream.flush()
+        except (BrokenPipeError, OSError, ValueError):
+            logger.error("upstream MCP server stdin is closed (child exited?)")
 
 
 def _forward_stderr(proc: subprocess.Popen[bytes]) -> None:
@@ -82,21 +133,38 @@ def handle_tools_call(
     request_id = message.get("id")
     logger.info("intercept tools/call server=%s tool=%s id=%s", server_name, tool_name, request_id)
 
+    approval_id = str(uuid.uuid4())
+    _inflight.add(request_id, approval_id)
+    raw_params = message.get("params")
     try:
         result = client.request_approval(
             server_name=server_name,
             tool_name=tool_name,
             arguments=arguments,
             transport="stdio",
-            raw_params=message.get("params") or {},
+            raw_params=raw_params if isinstance(raw_params, dict) else {},
             metadata={"jsonrpc_id": request_id},
+            approval_id=approval_id,
         )
     except DaemonUnavailable:
+        cancelled = _inflight.pop(request_id)
         logger.error("daemon unavailable; fail_closed=%s", fail_closed)
+        if cancelled:
+            return
         if fail_closed:
             _write_stdout(daemon_down_response(request_id))
             return
         _write_raw_to(proc.stdin, encode_message(message))
+        return
+    except Exception:  # noqa: BLE001 — always answer the request, fail closed
+        _inflight.pop(request_id)
+        logger.exception("approval failed unexpectedly; blocking")
+        _write_stdout(blocked_response(request_id, "internal error"))
+        return
+
+    if _inflight.pop(request_id):
+        # Client sent notifications/cancelled while we waited: never execute.
+        logger.info("tools/call id=%s was cancelled by the client; not forwarding", request_id)
         return
 
     if result.decision == Decision.TIMEOUT:
@@ -127,6 +195,34 @@ def handle_client_message(
     """
     assert proc.stdin is not None
 
+    if isinstance(message, list):
+        # JSON-RPC batch. MCP 2025-06-18 dropped batching, but older clients may
+        # send it: never let a batched tools/call bypass approval. Split it into
+        # single messages (each tools/call is approved independently).
+        if not message:
+            _write_stdout(error_response(None, -32600, "Invalid Request: empty batch"))
+            return
+        if batch_contains_tools_call(message):
+            for item in message:
+                handle_client_message(
+                    item,
+                    proc=proc,
+                    client=client,
+                    server_name=server_name,
+                    fail_closed=fail_closed,
+                    workers=workers,
+                )
+            return
+        _write_raw_to(proc.stdin, encode_message(message))  # type: ignore[arg-type]
+        return
+
+    cancel_id = cancelled_request_id(message)
+    if cancel_id is not None:
+        approval_id = _inflight.cancel(cancel_id)
+        if approval_id is not None:
+            client.cancel(approval_id)  # popup disappears
+            return  # the child never saw this request, so don't forward
+
     if not is_tools_call(message):
         _write_raw_to(proc.stdin, encode_message(message))
         return
@@ -152,7 +248,7 @@ def run_stdio_proxy(
     server_name: str,
     env: dict[str, str] | None = None,
     client: ApprovalClient | None = None,
-    stdin: TextIO | None = None,
+    stdin: TextIO | BinaryIO | None = None,
 ) -> int:
     """
     Run the proxy until the child exits or stdin closes.
@@ -168,14 +264,29 @@ def run_stdio_proxy(
     if env:
         child_env.update(env)
 
+    # Windows: CreateProcess only appends ".exe", so "npx"/"npm" (npx.cmd)
+    # would raise FileNotFoundError. Resolve via PATH/PATHEXT like a shell does.
+    resolved = shutil.which(command[0], path=child_env.get("PATH"))
+    if resolved:
+        command = [resolved, *command[1:]]
+    creationflags = 0
+    if sys.platform == "win32":
+        # Don't flash a console window for node/npx children.
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
     logger.info("starting upstream: %s (server_name=%s)", command, server_name)
-    proc = subprocess.Popen(
-        command,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=child_env,
-    )
+    try:
+        proc = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=child_env,
+            creationflags=creationflags,
+        )
+    except OSError as exc:
+        logger.error("cannot start upstream MCP server %r: %s", command[0], exc)
+        return 127
 
     t_out = threading.Thread(target=_forward_child_stdout, args=(proc,), daemon=True)
     t_err = threading.Thread(target=_forward_stderr, args=(proc,), daemon=True)
@@ -183,11 +294,14 @@ def run_stdio_proxy(
     t_err.start()
 
     workers: list[threading.Thread] = []
-    input_stream = stdin or sys.stdin
+    # Read raw bytes: MCP stdio is UTF-8 by spec, but on Windows sys.stdin is
+    # decoded with the ANSI code page (cp1252) when piped, which corrupts
+    # non-ASCII arguments and can crash on bytes like 0x81.
+    input_stream = stdin if stdin is not None else sys.stdin.buffer
     try:
         while True:
             line = input_stream.readline()
-            if line == "" or line is None:
+            if not line:
                 break
             try:
                 message = parse_message(line)
@@ -210,6 +324,10 @@ def run_stdio_proxy(
                 workers=workers,
             )
     finally:
+        # Claude closed the pipe: withdraw every pending popup and make sure a
+        # late "Allow" can't execute a call nobody is waiting for.
+        for approval_id in _inflight.cancel_all():
+            client.cancel(approval_id)
         for worker in workers:
             worker.join(timeout=settings.approval_timeout_seconds + 15)
         if proc.stdin and not proc.stdin.closed:

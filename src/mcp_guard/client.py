@@ -47,8 +47,10 @@ class ApprovalClient:
         transport: str,
         raw_params: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
+        approval_id: str | None = None,
     ) -> DecisionResult:
         payload = ApprovalRequestCreate(
+            id=approval_id,
             server_name=server_name,
             tool_name=tool_name,
             arguments=arguments,
@@ -57,7 +59,16 @@ class ApprovalClient:
             metadata=metadata or {},
         )
         try:
-            with httpx.Client(timeout=self.timeout) as client:
+            # The *daemon* owns the approval timeout. A proxy launched by Claude
+            # Desktop usually doesn't inherit MCP_GUARD_TIMEOUT, so never let the
+            # client give up first (that would be misreported as daemon-down).
+            read_timeout = self.timeout
+            try:
+                read_timeout = max(read_timeout, float(self.health()["approval_timeout_seconds"]) + 10)
+            except (DaemonUnavailable, KeyError, TypeError, ValueError):
+                pass
+            timeout = httpx.Timeout(5.0, read=read_timeout)
+            with httpx.Client(timeout=timeout) as client:
                 resp = client.post(
                     f"{self.base_url}/v1/approvals",
                     json=payload.model_dump(mode="json"),
@@ -75,6 +86,14 @@ class ApprovalClient:
             )
             resp.raise_for_status()
             return DecisionResult.model_validate(resp.json())
+
+    def cancel(self, approval_id: str) -> None:
+        """Best-effort: withdraw a pending approval (popup disappears)."""
+        try:
+            with httpx.Client(timeout=2.0) as client:
+                client.post(f"{self.base_url}/v1/approvals/{approval_id}/cancel")
+        except (httpx.HTTPError, OSError):
+            pass
 
     def list_pending(self) -> list[dict[str, Any]]:
         with httpx.Client(timeout=5.0) as client:

@@ -117,7 +117,10 @@ def run_tk_ui(controller: ApprovalUIController) -> int:
         "<Configure>",
         lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
     )
-    canvas.create_window((0, 0), window=frame, anchor="nw")
+    frame_id = canvas.create_window((0, 0), window=frame, anchor="nw")
+    # Keep the panel list exactly as wide as the visible canvas; otherwise the
+    # ScrolledText's natural width pushes the Block button off-screen.
+    canvas.bind("<Configure>", lambda e: canvas.itemconfigure(frame_id, width=e.width))
     canvas.configure(yscrollcommand=scrollbar.set)
     canvas.pack(side="left", fill="both", expand=True, padx=(16, 0), pady=8)
     scrollbar.pack(side="right", fill="y", padx=(0, 8), pady=8)
@@ -130,8 +133,21 @@ def run_tk_ui(controller: ApprovalUIController) -> int:
                 panels[rid].destroy()
                 del panels[rid]
 
+    def bring_to_front() -> None:
+        """Pop the window over everything, even if the user minimised it."""
+        try:
+            root.deiconify()
+            root.attributes("-topmost", True)
+            root.lift()
+            root.focus_force()
+            root.bell()
+        except tk.TclError:
+            pass
+
     def render(pending: list[dict[str, Any]]) -> None:
         active = {p["id"] for p in pending}
+        if active - set(panels):
+            bring_to_front()  # a *new* request arrived
         clear_stale(active)
         for item in pending:
             rid = item["id"]
@@ -153,7 +169,7 @@ def run_tk_ui(controller: ApprovalUIController) -> int:
             )
             meta.pack(anchor="w")
 
-            args_view = scrolledtext.ScrolledText(box, height=8, wrap="word")
+            args_view = scrolledtext.ScrolledText(box, height=8, width=40, wrap="word")
             args_view.insert("1.0", _format_arguments(item.get("arguments") or {}))
             args_view.configure(state="disabled")
             args_view.pack(fill="x", pady=6)
@@ -167,6 +183,10 @@ def run_tk_ui(controller: ApprovalUIController) -> int:
                         controller.decide(request_id, decision)
                     except Exception as exc:  # noqa: BLE001
                         logger.error("decide failed: %s", exc)
+                    # Remove the panel immediately (no double clicks / 404s).
+                    panel = panels.pop(request_id, None)
+                    if panel is not None:
+                        panel.destroy()
 
                 return _handler
 
@@ -211,11 +231,14 @@ def run_tk_ui(controller: ApprovalUIController) -> int:
     def keep_topmost() -> None:
         if controller._stop.is_set():
             return
-        try:
-            root.attributes("-topmost", True)
-            root.lift()
-        except tk.TclError:
-            pass
+        # Only fight for the top while something is actually waiting; an idle
+        # window that keeps stealing z-order is just in the user's way.
+        if any(k != "empty" for k in panels):
+            try:
+                root.attributes("-topmost", True)
+                root.lift()
+            except tk.TclError:
+                pass
         root.after(2000, keep_topmost)
 
     poll()

@@ -75,6 +75,35 @@ mcp-guard install --only mcp-guard-demo
 mcp-guard status
 ```
 
+**Windows PowerShell** (the `<<'PY'` heredoc above is bash-only). Pipe a
+here-string into the venv's Python instead:
+
+```powershell
+@'
+import json, sys
+from mcp_guard.paths import claude_desktop_config_path
+path = claude_desktop_config_path()
+path.parent.mkdir(parents=True, exist_ok=True)
+data = {"mcpServers": {}}
+if path.exists():
+    data = json.loads(path.read_text(encoding="utf-8-sig"))
+    data.setdefault("mcpServers", {})
+data["mcpServers"]["mcp-guard-demo"] = {
+    "command": sys.executable,
+    "args": ["-m", "mcp_guard.demo_server.stdio_server"],
+}
+path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+print("wrote", path)
+'@ | python -
+
+mcp-guard install --only mcp-guard-demo
+mcp-guard status
+```
+
+> Decide within ~50 s while recording: Claude's MCP client gives up on a
+> request after about 60 s, independently of `MCP_GUARD_TIMEOUT`. If Claude
+> cancels first, MCP Guard withdraws the popup and never runs the call.
+
 **Fully quit Claude Desktop** (macOS: Cmd+Q; Windows: tray → Quit) and reopen it.
 
 ### 2.2 Record — Allow path
@@ -132,7 +161,10 @@ cloudflared tunnel --url http://127.0.0.1:8742
 1. Copy the `https://…` URL from the tunnel.
 2. In Claude Web: **Customize → Connectors → Add custom connector**.
 3. Paste `https://<tunnel>/mcp` (Claude will POST to `/mcp` on the proxy,
-   which forwards to `http://127.0.0.1:8765/mcp`).
+   which forwards to `http://127.0.0.1:8765/mcp`). Recommended: start the
+   proxy with `MCP_GUARD_HTTP_TOKEN=<random>` and paste
+   `https://<tunnel>/<random>/mcp` instead, so nobody else who finds the
+   tunnel URL can reach it.
 4. Auth: “No sign in” for the local demo.
 5. In a chat, enable the connector and repeat the Allow / Block prompts from §2.
 6. Narrate: “Anthropic’s servers hit my tunnel; the local proxy holds

@@ -32,20 +32,37 @@ def encode_message(message: dict[str, Any]) -> bytes:
     )
 
 
-def is_request(message: dict[str, Any]) -> bool:
-    return "method" in message and "id" in message
+def is_request(message: Any) -> bool:
+    return isinstance(message, dict) and "method" in message and "id" in message
 
 
-def is_notification(message: dict[str, Any]) -> bool:
-    return "method" in message and "id" not in message
+def is_notification(message: Any) -> bool:
+    return isinstance(message, dict) and "method" in message and "id" not in message
 
 
-def is_tools_call(message: dict[str, Any]) -> bool:
+def is_tools_call(message: Any) -> bool:
     return is_request(message) and message.get("method") == "tools/call"
+
+
+def batch_contains_tools_call(message: Any) -> bool:
+    """True if ``message`` is a JSON-RPC batch (list) with any tools/call in it."""
+    return isinstance(message, list) and any(is_tools_call(m) for m in message)
+
+
+def cancelled_request_id(message: Any) -> Any:
+    """Return params.requestId for a notifications/cancelled message, else None."""
+    if is_notification(message) and message.get("method") == "notifications/cancelled":
+        params = message.get("params") or {}
+        if isinstance(params, dict):
+            return params.get("requestId")
+    return None
 
 
 def extract_tool_call(message: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     params = message.get("params") or {}
+    if not isinstance(params, dict):
+        # Malformed params must still go through approval, never crash the proxy.
+        return "unknown", {"_raw_params": params}
     name = params.get("name") or "unknown"
     arguments = params.get("arguments") or {}
     if not isinstance(arguments, dict):

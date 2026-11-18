@@ -31,6 +31,9 @@ class ApprovalRequestCreate(BaseModel):
     method: str = "tools/call"
     raw_params: dict[str, Any] = Field(default_factory=dict)
     metadata: dict[str, Any] = Field(default_factory=dict)
+    # Optional proxy-generated id so the proxy can later cancel this approval
+    # (e.g. on notifications/cancelled) and so audit events correlate.
+    id: str | None = Field(default=None, max_length=64)
 
 
 class PendingApproval(BaseModel):

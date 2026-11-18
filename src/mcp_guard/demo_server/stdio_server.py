@@ -39,8 +39,12 @@ TOOLS = [
 
 
 def _respond(message: dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")
-    sys.stdout.flush()
+    # Binary + explicit UTF-8: on Windows text-mode stdout would use cp1252 and
+    # translate "\n" to "\r\n".
+    sys.stdout.buffer.write(
+        (json.dumps(message, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
+    )
+    sys.stdout.buffer.flush()
 
 
 def _handle(message: dict[str, Any]) -> None:
@@ -112,8 +116,8 @@ def _handle(message: dict[str, Any]) -> None:
 
 
 def main() -> int:
-    for line in sys.stdin:
-        line = line.strip()
+    for raw in sys.stdin.buffer:
+        line = raw.decode("utf-8", errors="replace").strip()
         if not line:
             continue
         try:
@@ -121,6 +125,11 @@ def main() -> int:
         except json.JSONDecodeError as exc:
             sys.stderr.write(f"invalid json: {exc}\n")
             sys.stderr.flush()
+            continue
+        if not isinstance(message, dict):
+            # Batches are not supported by this tiny demo server.
+            _respond({"jsonrpc": "2.0", "id": None,
+                      "error": {"code": -32600, "message": "Invalid Request"}})
             continue
         _handle(message)
     return 0

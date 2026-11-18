@@ -49,7 +49,9 @@ class ApprovalQueue:
 
     async def submit_and_wait(self, create: ApprovalRequestCreate) -> DecisionResult:
         expires_at = utc_now() + timedelta(seconds=self.timeout_seconds)
+        extra = {"id": create.id} if create.id else {}
         pending = PendingApproval(
+            **extra,
             expires_at=expires_at,
             server_name=create.server_name,
             tool_name=create.tool_name,
@@ -63,6 +65,8 @@ class ApprovalQueue:
         future: asyncio.Future[DecisionResult] = loop.create_future()
 
         async with self._lock:
+            if pending.id in self._pending:
+                raise ValueError(f"duplicate approval id: {pending.id}")
             self._pending[pending.id] = pending
             self._futures[pending.id] = future
 
@@ -76,6 +80,14 @@ class ApprovalQueue:
 
         try:
             return await asyncio.wait_for(future, timeout=self.timeout_seconds)
+        except asyncio.CancelledError:
+            # Caller went away (daemon shutdown / handler cancelled): never leave
+            # a ghost popup behind.
+            async with self._lock:
+                self._pending.pop(pending.id, None)
+                self._futures.pop(pending.id, None)
+            self._notify()
+            raise
         except asyncio.TimeoutError:
             decision = Decision.BLOCK if self.fail_closed else Decision.ALLOW
             result = DecisionResult(
@@ -112,7 +124,7 @@ class ApprovalQueue:
         async with self._lock:
             pending = self._pending.get(request_id)
             future = self._futures.get(request_id)
-            if pending is None or future is None:
+            if pending is None or future is None or future.done():
                 raise KeyError(f"unknown or already decided request: {request_id}")
             result = DecisionResult(
                 id=pending.id,
@@ -126,6 +138,10 @@ class ApprovalQueue:
 
         await self._finalize(request_id, result, from_timeout=False)
         return result
+
+    async def cancel(self, request_id: str, *, reason: str = "cancelled") -> DecisionResult:
+        """Resolve a pending approval as BLOCK because the client cancelled it."""
+        return await self.decide(request_id, Decision.BLOCK, decided_by=reason)
 
     async def _finalize(
         self,

@@ -22,13 +22,19 @@ on the Claude connector pointing at the *proxied* URL.
 from __future__ import annotations
 
 import argparse
+import hmac
+import json
 import logging
+import os
+import uuid
 from typing import Any
 
+import anyio
 import httpx
 import uvicorn
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 
 from mcp_guard.client import ApprovalClient, DaemonUnavailable, decision_allows_forward
 from mcp_guard.constants import (
@@ -39,7 +45,13 @@ from mcp_guard.constants import (
     TIMEOUT_ERROR_CODE,
     TIMEOUT_ERROR_MESSAGE,
 )
-from mcp_guard.jsonrpc import extract_tool_call, is_tools_call
+from mcp_guard.jsonrpc import (
+    batch_contains_tools_call,
+    cancelled_request_id,
+    extract_tool_call,
+    is_request,
+    is_tools_call,
+)
 from mcp_guard.models import Decision
 from mcp_guard.settings import Settings, get_settings
 
@@ -57,6 +69,12 @@ HOP_BY_HOP = {
     "host",
     "content-length",
 }
+# httpx transparently decompresses upstream bodies, so never echo the upstream
+# Content-Encoding (the client would try to gunzip plain JSON).
+RESPONSE_DROP = HOP_BY_HOP | {"content-encoding"}
+
+# (Mcp-Session-Id, repr(jsonrpc id)) -> daemon approval id, for cancellation.
+_inflight: dict[tuple[str, str], str] = {}
 
 
 def join_upstream_url(upstream_base: str, path: str) -> str:
@@ -91,21 +109,45 @@ def create_http_proxy_app(
     settings = settings or get_settings()
     client = client or ApprovalClient(settings)
     upstream_base = upstream_base.rstrip("/") + "/"
+    # Optional shared secret for the public tunnel URL. When set, Claude's
+    # connector URL must be https://<tunnel>/<token>/mcp (or send
+    # "Authorization: Bearer <token>"), so strangers who find the tunnel can't
+    # spam approval popups or probe the upstream.
+    token = os.environ.get("MCP_GUARD_HTTP_TOKEN") or None
 
     app = FastAPI(title="MCP Guard HTTP Proxy", version="1.0.0")
+    http = httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=None))
+
+    @app.on_event("shutdown")
+    async def _close_http() -> None:
+        await http.aclose()
+
+    # Registered *before* the catch-all route, otherwise it is shadowed.
+    @app.get("/_mcp_guard/health")
+    async def health() -> dict[str, Any]:
+        return {
+            "status": "ok",
+            "upstream": upstream_base,
+            "server_name": server_name,
+            "token_required": token is not None,
+        }
 
     @app.api_route("/{path:path}", methods=["GET", "POST", "DELETE", "OPTIONS", "HEAD"])
     async def proxy(path: str, request: Request) -> Response:
+        if token is not None:
+            auth = request.headers.get("authorization", "")
+            first, _, rest = path.partition("/")
+            if hmac.compare_digest(first, token):
+                path = rest
+            elif not hmac.compare_digest(auth, f"Bearer {token}"):
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
         target = join_upstream_url(upstream_base, path)
         if request.url.query:
             target = f"{target}?{request.url.query}"
 
         body = await request.body()
-        headers = {
-            k: v
-            for k, v in request.headers.items()
-            if k.lower() not in HOP_BY_HOP
-        }
+        drop = HOP_BY_HOP | ({"authorization"} if token is not None else set())
+        headers = {k: v for k, v in request.headers.items() if k.lower() not in drop}
 
         # Intercept tools/call on POST JSON bodies (Streamable HTTP).
         if request.method == "POST" and body:
@@ -114,30 +156,31 @@ def create_http_proxy_app(
                 client=client,
                 server_name=server_name,
                 fail_closed=settings.fail_closed,
+                session_id=request.headers.get("mcp-session-id", ""),
             )
             if intercepted is not None:
+                if intercepted == {}:
+                    return Response(status_code=202)  # cancelled notification consumed
                 return JSONResponse(intercepted)
 
-        timeout = httpx.Timeout(settings.approval_timeout_seconds + 60.0)
-        async with httpx.AsyncClient(timeout=timeout) as http:
-            try:
-                upstream = await http.request(
-                    request.method,
-                    target,
-                    content=body,
-                    headers=headers,
-                )
-            except httpx.HTTPError as exc:
-                logger.exception("upstream request failed: %s", exc)
-                return JSONResponse(
-                    {"error": "upstream_unreachable", "detail": str(exc)},
-                    status_code=502,
-                )
+        try:
+            upstream_req = http.build_request(
+                request.method, target, content=body, headers=headers
+            )
+            # stream=True: forward SSE events as they arrive (progress
+            # notifications, long-lived GET streams) instead of buffering.
+            upstream = await http.send(upstream_req, stream=True)
+        except httpx.HTTPError as exc:
+            logger.exception("upstream request failed: %s", exc)
+            return JSONResponse(
+                {"error": "upstream_unreachable", "detail": str(exc)},
+                status_code=502,
+            )
 
         resp_headers = {
             k: v
             for k, v in upstream.headers.items()
-            if k.lower() not in HOP_BY_HOP
+            if k.lower() not in RESPONSE_DROP
         }
         content_type = upstream.headers.get("content-type", "")
         if "text/event-stream" in content_type:
@@ -146,21 +189,18 @@ def create_http_proxy_app(
                 status_code=upstream.status_code,
                 headers=resp_headers,
                 media_type=content_type,
+                background=BackgroundTask(upstream.aclose),
             )
+        try:
+            content = await upstream.aread()
+        finally:
+            await upstream.aclose()
         return Response(
-            content=upstream.content,
+            content=content,
             status_code=upstream.status_code,
             headers=resp_headers,
             media_type=content_type or None,
         )
-
-    @app.get("/_mcp_guard/health")
-    async def health() -> dict[str, Any]:
-        return {
-            "status": "ok",
-            "upstream": upstream_base,
-            "server_name": server_name,
-        }
 
     return app
 
@@ -171,15 +211,36 @@ async def _maybe_intercept(
     client: ApprovalClient,
     server_name: str,
     fail_closed: bool,
-) -> dict[str, Any] | None:
-    """Return a JSON-RPC error response if blocked; None to forward."""
-    import json
+    session_id: str = "",
+) -> Any:
+    """Return a JSON-RPC error response if blocked; None to forward.
 
+    Returns ``{}`` when the message was a cancellation we consumed locally.
+    """
     try:
         message = json.loads(body)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return None
-    if not isinstance(message, dict) or not is_tools_call(message):
+
+    if batch_contains_tools_call(message):
+        # Never let a batched tools/call slip past approval. MCP 2025-06-18
+        # removed batching, so rejecting the whole batch is safe.
+        logger.warning("rejecting JSON-RPC batch containing tools/call")
+        return [
+            _jsonrpc_error(m.get("id"), -32600, "MCP Guard: batched tools/call not supported")
+            for m in message
+            if is_request(m)
+        ]
+
+    cancel_id = cancelled_request_id(message)
+    if cancel_id is not None:
+        approval_id = _inflight.pop((session_id, repr(cancel_id)), None)
+        if approval_id is not None:
+            await anyio.to_thread.run_sync(lambda: client.cancel(approval_id))
+            return {}
+        return None
+
+    if not is_tools_call(message):
         return None
 
     tool_name, arguments = extract_tool_call(message)
@@ -191,22 +252,26 @@ async def _maybe_intercept(
         request_id,
     )
 
+    approval_id = str(uuid.uuid4())
+    key = (session_id, repr(request_id))
+    _inflight[key] = approval_id
+    raw_params = message.get("params")
     try:
         # httpx sync client in thread — daemon API is sync-friendly and
         # approval waits are long-running by design.
-        import anyio
-
         result = await anyio.to_thread.run_sync(
             lambda: client.request_approval(
                 server_name=server_name,
                 tool_name=tool_name,
                 arguments=arguments,
                 transport="http",
-                raw_params=message.get("params") or {},
-                metadata={"jsonrpc_id": request_id},
+                raw_params=raw_params if isinstance(raw_params, dict) else {},
+                metadata={"jsonrpc_id": request_id, "mcp_session_id": session_id},
+                approval_id=approval_id,
             )
         )
     except DaemonUnavailable:
+        _inflight.pop(key, None)
         if fail_closed:
             return _jsonrpc_error(
                 request_id,
@@ -215,6 +280,9 @@ async def _maybe_intercept(
             )
         return None
 
+    _inflight.pop(key, None)
+    if result.decided_by == "cancelled":
+        return _jsonrpc_error(request_id, BLOCKED_ERROR_CODE, "MCP Guard: request cancelled by client")
     if result.decision == Decision.TIMEOUT:
         return _jsonrpc_error(request_id, TIMEOUT_ERROR_CODE, TIMEOUT_ERROR_MESSAGE)
     if result.decision == Decision.BLOCK or not decision_allows_forward(result):
