@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mcp-guard-demo": {
+      "command": "python3",
+      "args": ["-m", "mcp_guard.demo_server.stdio_server"]
+    }
+  }
+}
