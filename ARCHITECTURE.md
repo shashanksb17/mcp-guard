@@ -65,8 +65,7 @@ flowchart TB
 stdio proxy instead. The proxy spawns the original command, relays all messages,
 and **only** stalls on `tools/call`.
 
-This matches the assignment hypothesis and is the industry-standard pattern for
-stdio MCP policy proxies.
+This is the industry-standard pattern for stdio MCP policy proxies.
 
 ### Claude Web — remote connectors (Streamable HTTP / SSE)
 
@@ -188,8 +187,8 @@ developers can debug connectivity without fighting the gate.
 |----------|------|------|
 | **Stdio wrapper + HTTP reverse proxy (this repo)** | Protocol-correct; holds the real request; works offline for Desktop; explainable | Web needs a tunnel; must own the connector URL; extensions need extra work |
 | OS network MITM / packet filter | Could see raw HTTPS | Breaks TLS; cannot decode MCP without keys; overkill and brittle |
-| Inject into Claude Desktop process | Might catch more surfaces | Undocumented, fragile across versions, poor interview signal |
-| Claude’s own tool-approval UI only | Native UX | Not a take-home you control; doesn’t prove interception |
+| Inject into Claude Desktop process | Might catch more surfaces | Undocumented, fragile across versions, and hard to maintain |
+| Claude’s own tool-approval UI only | Native UX | You don’t control the UI; it doesn’t prove you intercepted the protocol |
 
 ## Security notes (summary)
 
@@ -202,7 +201,7 @@ developers can debug connectivity without fighting the gate.
   internet (Anthropic will call it). Add auth headers / OAuth on that
   connector and prefer ephemeral demo tunnels.
 
-## Why this is interview-friendly
+## Why this design
 
 - Clear separation: **transport proxy** vs **policy daemon** vs **UI**.
 - Same approval API for Desktop and Web.

@@ -1,7 +1,5 @@
 # Demo script (record on your Mac or Windows laptop)
 
-**Deadline reminder:** Friday 20 Nov 2026, EOD IST.
-
 Record a 3–5 minute screencast showing **Allow** and **Block**. You need
 **Claude Desktop** for the best Desktop path. Claude Web requires a public
 HTTPS tunnel (Cloudflare Tunnel or ngrok).

@@ -8,8 +8,6 @@ shows an always-on-top confirmation with the server name, tool, and parameters,
 and only forwards the call if you click **Allow**. **Block** returns a
 JSON-RPC error and the upstream server never sees the invocation.
 
-> Take-home assignment · Deadline **Friday 20 Nov 2026, EOD IST**
-
 ---
 
 ## Quick start
